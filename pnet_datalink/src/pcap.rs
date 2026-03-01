@@ -6,6 +6,7 @@ use std::marker::{Send, Sync};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::SystemTime;
 
 use pcap::{Activated, Active};
 
@@ -165,17 +166,34 @@ struct DataLinkReceiverImpl<T: Activated + Send + Sync> {
     read_buffer: Vec<u8>,
 }
 
-impl<T: Activated + Send + Sync> DataLinkReceiver for DataLinkReceiverImpl<T> {
-    fn next(&mut self) -> io::Result<&[u8]> {
+impl<T: Activated + Send + Sync> DataLinkReceiverImpl<T> {
+    // Receives the next packet into read_buffer and returns its capture timestamp.
+    fn next_impl(&mut self) -> io::Result<Option<SystemTime>> {
         let mut cap = self.capture.lock().unwrap();
         match cap.next_packet() {
             Ok(pkt) => {
+                let ts = crate::system_time_from_unix(
+                    pkt.header.ts.tv_sec as i64,
+                    pkt.header.ts.tv_usec as i64 * 1_000,
+                );
                 self.read_buffer.truncate(0);
                 self.read_buffer.extend(pkt.data);
+                Ok(Some(ts))
             }
-            Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
-        };
+            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+        }
+    }
+}
+
+impl<T: Activated + Send + Sync> DataLinkReceiver for DataLinkReceiverImpl<T> {
+    fn next(&mut self) -> io::Result<&[u8]> {
+        self.next_impl()?;
         Ok(&self.read_buffer)
+    }
+
+    fn next_with_metadata(&mut self) -> io::Result<(&[u8], crate::PacketMetadata)> {
+        let ts = self.next_impl()?;
+        Ok((&self.read_buffer, crate::PacketMetadata { timestamp: ts }))
     }
 }
 

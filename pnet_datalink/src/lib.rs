@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::option::Option;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use ipnetwork::IpNetwork;
 
@@ -159,6 +160,19 @@ pub struct Config {
 
     /// Linux only: The socket's file descriptor that pnet will use
     pub socket_fd: Option<i32>,
+
+    /// Whether to request kernel capture timestamps.
+    ///
+    /// On BPF backends (macOS/BSD), timestamps are embedded in the BPF header at zero
+    /// additional cost and are always available regardless of this setting.
+    /// On Linux, this enables `SO_TIMESTAMPNS` on the `AF_PACKET` socket, which causes
+    /// the kernel to attach a `timespec` (nanosecond precision) to each received packet
+    /// via `recvmsg(2)`.
+    /// On pcap, timestamps are always available from the pcap packet header regardless
+    /// of this setting.
+    /// On the dummy backend, this field is ignored and no timestamp is ever returned.
+    /// Defaults to false.
+    pub enable_timestamps: bool,
 }
 
 impl Default for Config {
@@ -173,6 +187,7 @@ impl Default for Config {
             linux_fanout: None,
             promiscuous: true,
             socket_fd: None,
+            enable_timestamps: false,
         }
     }
 }
@@ -222,11 +237,53 @@ pub trait DataLinkSender: Send {
     fn send_to(&mut self, packet: &[u8], dst: Option<NetworkInterface>) -> Option<io::Result<()>>;
 }
 
+/// Converts a Unix timestamp (whole seconds + nanoseconds) to a [`SystemTime`].
+///
+/// Returns [`std::time::UNIX_EPOCH`] for timestamps with negative `secs` or `nanos`,
+/// which are invalid but can appear from malformed kernel data.
+///
+/// Callers that receive microseconds (e.g. `timeval`) must multiply `tv_usec` by 1000
+/// before passing it as `nanos`.
+pub(crate) fn system_time_from_unix(secs: i64, nanos: i64) -> SystemTime {
+    use std::time::{Duration, UNIX_EPOCH};
+    if secs < 0 || nanos < 0 {
+        return UNIX_EPOCH;
+    }
+    UNIX_EPOCH + Duration::new(secs as u64, nanos as u32)
+}
+
+/// Metadata associated with a received packet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PacketMetadata {
+    /// The kernel capture timestamp for this packet, if the backend supports it.
+    ///
+    /// On BPF platforms (macOS/BSD/Windows), this is always populated from the
+    /// `bh_tstamp` field in the BPF header, which is set by the kernel when the
+    /// packet is captured.
+    /// On Linux, this is populated when `Config::enable_timestamps` is `true`.
+    /// On other backends, this is `None`.
+    ///
+    /// Comparing this timestamp against `SystemTime::now()` after `next_with_metadata()`
+    /// returns gives the delay between kernel capture time and application processing time,
+    /// which includes any time the packet spent in the receive buffer.
+    pub timestamp: Option<SystemTime>,
+}
+
 /// Structure for receiving packets at the data link layer. Should be constructed using
 /// `datalink_channel()`.
 pub trait DataLinkReceiver: Send {
     /// Get the next ethernet frame in the channel.
     fn next(&mut self) -> io::Result<&[u8]>;
+
+    /// Get the next ethernet frame along with its capture metadata.
+    ///
+    /// The default implementation calls `next()` and returns [`PacketMetadata`] with
+    /// `timestamp: None`. Backends that support kernel capture timestamps override this
+    /// method to populate the timestamp field.
+    fn next_with_metadata(&mut self) -> io::Result<(&[u8], PacketMetadata)> {
+        let pkt = self.next()?;
+        Ok((pkt, PacketMetadata { timestamp: None }))
+    }
 }
 
 /// Represents a network interface and its associated addresses.
@@ -419,4 +476,49 @@ impl ::std::fmt::Display for NetworkInterface {
 ///
 pub fn interfaces() -> Vec<NetworkInterface> {
     backend::interfaces()
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::system_time_from_unix;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn zero_is_unix_epoch() {
+        assert_eq!(system_time_from_unix(0, 0), UNIX_EPOCH);
+    }
+
+    #[test]
+    fn one_second() {
+        assert_eq!(
+            system_time_from_unix(1, 0),
+            UNIX_EPOCH + Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn nanoseconds() {
+        assert_eq!(
+            system_time_from_unix(0, 500_000_000),
+            UNIX_EPOCH + Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn negative_secs_returns_epoch() {
+        assert_eq!(system_time_from_unix(-1, 0), UNIX_EPOCH);
+    }
+
+    #[test]
+    fn negative_nanos_returns_epoch() {
+        assert_eq!(system_time_from_unix(0, -1), UNIX_EPOCH);
+    }
+
+    #[test]
+    fn combined() {
+        assert_eq!(
+            system_time_from_unix(1, 500_000_000),
+            UNIX_EPOCH + Duration::from_millis(1500)
+        );
+    }
 }

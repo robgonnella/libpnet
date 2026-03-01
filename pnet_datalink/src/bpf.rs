@@ -20,6 +20,7 @@ use std::mem::{self, align_of};
 use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
 
 static ETHERNET_HEADER_SIZE: usize = 14;
 static NULL_HEADER_SIZE: usize = 4;
@@ -381,11 +382,13 @@ struct DataLinkReceiverImpl {
     buffer_offset: usize,
     loopback: bool,
     timeout: Option<libc::timespec>,
-    packets: VecDeque<(usize, usize)>,
+    packets: VecDeque<(usize, usize, Option<SystemTime>)>,
 }
 
-impl DataLinkReceiver for DataLinkReceiverImpl {
-    fn next(&mut self) -> io::Result<&[u8]> {
+impl DataLinkReceiverImpl {
+    // Returns (start_index, length, timestamp) — all owned values so the caller can
+    // independently borrow self.read_buffer afterwards without a borrow conflict.
+    fn next_impl(&mut self) -> io::Result<(usize, usize, Option<SystemTime>)> {
         let header_size = if self.loopback { NULL_HEADER_SIZE } else { 0 };
 
         if self.packets.is_empty() {
@@ -426,9 +429,14 @@ impl DataLinkReceiver for DataLinkReceiverImpl {
                         let packet: *const bpf::bpf_hdr = mem::transmute(ptr);
                         let start =
                             ptr as isize + (*packet).bh_hdrlen as isize - buffer.as_ptr() as isize;
+                        let ts = crate::system_time_from_unix(
+                            (*packet).bh_tstamp.tv_sec as i64,
+                            (*packet).bh_tstamp.tv_usec as i64 * 1_000,
+                        );
                         self.packets.push_back((
                             start as usize + header_size,
                             (*packet).bh_caplen as usize - header_size,
+                            Some(ts),
                         ));
                         let offset = (*packet).bh_hdrlen as isize + (*packet).bh_caplen as isize;
                         ptr = ptr.offset(bpf::BPF_WORDALIGN(offset));
@@ -436,13 +444,28 @@ impl DataLinkReceiver for DataLinkReceiverImpl {
                 }
             }
         }
-        let (start, mut len) = self.packets.pop_front().unwrap();
+        let (start, mut len, ts) = self.packets.pop_front().unwrap();
         len += self.buffer_offset;
         // Zero out part that will become fake ethernet header if on loopback.
         for i in (&mut self.read_buffer[start..start + self.buffer_offset]).iter_mut() {
             *i = 0;
         }
+        Ok((start, len, ts))
+    }
+}
+
+impl DataLinkReceiver for DataLinkReceiverImpl {
+    fn next(&mut self) -> io::Result<&[u8]> {
+        let (start, len, _ts) = self.next_impl()?;
         Ok(&self.read_buffer[start..start + len])
+    }
+
+    fn next_with_metadata(&mut self) -> io::Result<(&[u8], crate::PacketMetadata)> {
+        let (start, len, ts) = self.next_impl()?;
+        Ok((
+            &self.read_buffer[start..start + len],
+            crate::PacketMetadata { timestamp: ts },
+        ))
     }
 }
 

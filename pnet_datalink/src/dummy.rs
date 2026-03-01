@@ -298,6 +298,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn next_with_metadata_returns_packet_and_no_timestamp() {
+        let (inject_handle, _, _, mut rx) = create_net();
+
+        let buffer = vec![1u8, 2, 3, 4, 5];
+        inject_handle.send(Ok(buffer.into_boxed_slice())).unwrap();
+
+        let (pkt, meta) = rx.next_with_metadata().expect("Expected a packet");
+        assert_eq!(pkt, &[1u8, 2, 3, 4, 5]);
+        assert!(
+            meta.timestamp.is_none(),
+            "dummy backend should return no timestamp"
+        );
+    }
+
     fn create_net() -> (
         Sender<io::Result<Box<[u8]>>>,
         Receiver<Box<[u8]>>,

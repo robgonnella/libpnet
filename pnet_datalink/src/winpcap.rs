@@ -21,6 +21,7 @@ use std::mem;
 use std::slice;
 use std::str::from_utf8_unchecked;
 use std::sync::Arc;
+use std::time::SystemTime;
 use winapi::ctypes::c_char;
 
 use winapi::ctypes;
@@ -225,14 +226,15 @@ struct DataLinkReceiverImpl {
     adapter: Arc<WinPcapAdapter>,
     _read_buffer: Vec<u8>,
     packet: WinPcapPacket,
-    packets: VecDeque<(usize, usize)>,
+    packets: VecDeque<(usize, usize, Option<SystemTime>)>,
 }
 
 unsafe impl Send for DataLinkReceiverImpl {}
 unsafe impl Sync for DataLinkReceiverImpl {}
 
-impl DataLinkReceiver for DataLinkReceiverImpl {
-    fn next(&mut self) -> io::Result<&[u8]> {
+impl DataLinkReceiverImpl {
+    // Returns (buffer_offset, length, timestamp) — all owned values.
+    fn next_impl(&mut self) -> io::Result<(usize, usize, Option<SystemTime>)> {
         // NOTE Most of the logic here is identical to FreeBSD/OS X
         while self.packets.is_empty() {
             let ret = unsafe {
@@ -242,26 +244,49 @@ impl DataLinkReceiver for DataLinkReceiverImpl {
                 0 => return Err(io::Error::last_os_error()),
                 _ => unsafe { (*self.packet.packet).ulBytesReceived as isize },
             };
-            let mut ptr = unsafe { (*self.packet.packet).Buffer  as *mut c_char};
+            let mut ptr = unsafe { (*self.packet.packet).Buffer as *mut c_char };
             let end = unsafe { ((*self.packet.packet).Buffer as *mut c_char).offset(buflen) };
             while ptr < end {
                 unsafe {
                     let packet: *const bpf::bpf_hdr = mem::transmute(ptr);
                     let start = ptr as isize + (*packet).bh_hdrlen as isize
                         - (*self.packet.packet).Buffer as isize;
-                    self.packets
-                        .push_back((start as usize, (*packet).bh_caplen as usize));
+                    let ts = crate::system_time_from_unix(
+                        (*packet).bh_tstamp.tv_sec as i64,
+                        (*packet).bh_tstamp.tv_usec as i64 * 1_000,
+                    );
+                    self.packets.push_back((
+                        start as usize,
+                        (*packet).bh_caplen as usize,
+                        Some(ts),
+                    ));
                     let offset = (*packet).bh_hdrlen as isize + (*packet).bh_caplen as isize;
                     ptr = ptr.offset(bpf::BPF_WORDALIGN(offset));
                 }
             }
         }
-        let (start, len) = self.packets.pop_front().unwrap();
+        let (start, len, ts) = self.packets.pop_front().unwrap();
+        Ok((start, len, ts))
+    }
+}
+
+impl DataLinkReceiver for DataLinkReceiverImpl {
+    fn next(&mut self) -> io::Result<&[u8]> {
+        let (start, len, _ts) = self.next_impl()?;
         let slice = unsafe {
             let data = (*self.packet.packet).Buffer as usize + start;
             slice::from_raw_parts(data as *const u8, len)
         };
         Ok(slice)
+    }
+
+    fn next_with_metadata(&mut self) -> io::Result<(&[u8], crate::PacketMetadata)> {
+        let (start, len, ts) = self.next_impl()?;
+        let slice = unsafe {
+            let data = (*self.packet.packet).Buffer as usize + start;
+            slice::from_raw_parts(data as *const u8, len)
+        };
+        Ok((slice, crate::PacketMetadata { timestamp: ts }))
     }
 }
 

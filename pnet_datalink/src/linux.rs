@@ -17,8 +17,10 @@ use pnet_sys;
 
 use std::io;
 use std::mem;
+use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
 
 fn network_addr_to_sockaddr(
     ni: &NetworkInterface,
@@ -65,6 +67,12 @@ pub struct Config {
     pub promiscuous: bool,
 
     pub socket_fd: Option<i32>,
+
+    /// Whether to enable kernel capture timestamps via `SO_TIMESTAMPNS`.
+    /// When true, `recvmsg(2)` is used instead of `recvfrom(2)` and the kernel
+    /// attaches a `timespec` (nanosecond precision) to each received packet.
+    /// Defaults to false.
+    pub enable_timestamps: bool,
 }
 
 impl<'a> From<&'a super::Config> for Config {
@@ -78,6 +86,7 @@ impl<'a> From<&'a super::Config> for Config {
             fanout: config.linux_fanout,
             promiscuous: config.promiscuous,
             socket_fd: config.socket_fd,
+            enable_timestamps: config.enable_timestamps,
         }
     }
 }
@@ -93,6 +102,7 @@ impl Default for Config {
             fanout: None,
             promiscuous: true,
             socket_fd: None,
+            enable_timestamps: false,
         }
     }
 }
@@ -101,7 +111,7 @@ impl Default for Config {
 #[inline]
 pub fn channel(
     network_interface: &NetworkInterface,
-    config: Config,
+    config: Config
 ) -> io::Result<super::Channel> {
     let (_typ, proto) = match config.channel_type {
         super::ChannelType::Layer2 => (libc::SOCK_RAW, libc::ETH_P_ALL),
@@ -112,8 +122,8 @@ pub fn channel(
         Some(sock) => sock,
         None => match unsafe { libc::socket(libc::AF_PACKET, _typ, proto.to_be()) } {
             -1 => return Err(io::Error::last_os_error()),
-            fd => fd
-        }
+            fd => fd,
+        },
     };
 
     let mut addr: libc::sockaddr_storage = unsafe { mem::zeroed() };
@@ -196,6 +206,27 @@ pub fn channel(
         }
     }
 
+    // Enable SO_TIMESTAMPNS to get nanosecond-precision kernel capture timestamps via recvmsg(2).
+    if config.enable_timestamps {
+        let enable: libc::c_int = 1;
+        if unsafe {
+            libc::setsockopt(
+                socket,
+                libc::SOL_SOCKET,
+                libc::SO_TIMESTAMPNS,
+                (&enable as *const libc::c_int) as *const libc::c_void,
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        } == -1
+        {
+            let err = io::Error::last_os_error();
+            unsafe {
+                pnet_sys::close(socket);
+            }
+            return Err(err);
+        }
+    }
+
     // Enable nonblocking
     if unsafe { libc::fcntl(socket, libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
         let err = io::Error::last_os_error();
@@ -223,6 +254,7 @@ pub fn channel(
         timeout: config
             .read_timeout
             .map(|to| pnet_sys::duration_to_timespec(to)),
+        enable_timestamps: config.enable_timestamps,
     });
 
     Ok(super::Channel::Ethernet(sender, receiver))
@@ -356,49 +388,110 @@ struct DataLinkReceiverImpl {
     read_buffer: Vec<u8>,
     _channel_type: super::ChannelType,
     timeout: Option<libc::timespec>,
+    enable_timestamps: bool,
+}
+
+impl DataLinkReceiverImpl {
+    // Returns (packet_length, Option<SystemTime>) — owned values, no borrow of self.read_buffer.
+    fn next_impl(&mut self) -> io::Result<(usize, Option<SystemTime>)> {
+        let mut pollfd = libc::pollfd {
+            fd: self.socket.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+
+        // Clamp to i32::MAX ms to avoid silent truncation for very large timeouts.
+        // -1 (wait indefinitely) passes through unchanged.
+        let timeout_ms: libc::c_int = self
+            .timeout
+            .as_ref()
+            .map(|to| {
+                let ms = (to.tv_sec as i64 * 1000) + (to.tv_nsec as i64 / 1_000_000);
+                ms.min(i32::MAX as i64) as i32
+            })
+            .unwrap_or(-1);
+
+        let ret = unsafe {
+            libc::poll(&mut pollfd as *mut libc::pollfd, 1, timeout_ms)
+        };
+
+        if ret == -1 {
+            return Err(io::Error::last_os_error());
+        } else if ret == 0 {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out"));
+        } else if pollfd.revents & libc::POLLIN == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Unexpected poll event",
+            ));
+        }
+
+        if self.enable_timestamps {
+            // Use recvmsg(2) to receive the packet along with SCM_TIMESTAMPNS ancillary data.
+            // Size the control buffer exactly for one cmsghdr + timespec using CMSG_SPACE.
+            let cmsg_space =
+                unsafe { libc::CMSG_SPACE(mem::size_of::<libc::timespec>() as u32) as usize };
+            let mut control_buf = vec![0u8; cmsg_space];
+            let mut iov = libc::iovec {
+                iov_base: self.read_buffer.as_mut_ptr() as *mut libc::c_void,
+                iov_len: self.read_buffer.len(),
+            };
+            let mut msghdr: libc::msghdr = unsafe { mem::zeroed() };
+            msghdr.msg_iov = &mut iov;
+            msghdr.msg_iovlen = 1;
+            msghdr.msg_control = control_buf.as_mut_ptr() as *mut libc::c_void;
+            msghdr.msg_controllen = control_buf.len() as _;
+
+            let len = unsafe { libc::recvmsg(self.socket.fd, &mut msghdr, 0) };
+            if len < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            // If the kernel truncated the control message the timestamp is unavailable.
+            if msghdr.msg_flags & libc::MSG_CTRUNC != 0 {
+                return Ok((len as usize, None));
+            }
+
+            // Walk control messages looking for SCM_TIMESTAMPNS.
+            let mut ts: Option<SystemTime> = None;
+            let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msghdr) };
+            while !cmsg.is_null() {
+                unsafe {
+                    if (*cmsg).cmsg_level == libc::SOL_SOCKET
+                        && (*cmsg).cmsg_type == libc::SCM_TIMESTAMPNS
+                    {
+                        let tv: libc::timespec =
+                            ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::timespec);
+                        ts = Some(crate::system_time_from_unix(tv.tv_sec as i64, tv.tv_nsec as i64));
+                        break;
+                    }
+                    cmsg = libc::CMSG_NXTHDR(&msghdr, cmsg);
+                }
+            }
+            Ok((len as usize, ts))
+        } else {
+            let mut caddr: libc::sockaddr_storage = unsafe { mem::zeroed() };
+            let res = pnet_sys::recv_from(self.socket.fd, &mut self.read_buffer, &mut caddr);
+            match res {
+                Ok(len) => Ok((len, None)),
+                Err(e) => Err(e),
+            }
+        }
+    }
 }
 
 impl DataLinkReceiver for DataLinkReceiverImpl {
     fn next(&mut self) -> io::Result<&[u8]> {
-        let mut caddr: libc::sockaddr_storage = unsafe { mem::zeroed() };
-        let mut pollfd = libc::pollfd {
-            fd: self.socket.fd,
-            events: libc::POLLIN, // Monitoring for read availability
-            revents: 0,
-        };
+        let (len, _ts) = self.next_impl()?;
+        Ok(&self.read_buffer[0..len])
+    }
 
-        // Convert timeout to milliseconds as required by poll
-        let timeout_ms = self
-            .timeout
-            .as_ref()
-            .map(|to| (to.tv_sec as i64 * 1000) + (to.tv_nsec as i64 / 1_000_000))
-            .unwrap_or(-1); // -1 means wait indefinitely
-
-        let ret = unsafe {
-            libc::poll(
-                &mut pollfd as *mut libc::pollfd,
-                1,
-                timeout_ms as libc::c_int,
-            )
-        };
-
-        if ret == -1 {
-            Err(io::Error::last_os_error())
-        } else if ret == 0 {
-            Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out"))
-        } else if pollfd.revents & libc::POLLIN != 0 {
-            // POLLIN is set, meaning the socket has data to be read
-            let res = pnet_sys::recv_from(self.socket.fd, &mut self.read_buffer, &mut caddr);
-            match res {
-                Ok(len) => Ok(&self.read_buffer[0..len]),
-                Err(e) => Err(e),
-            }
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Unexpected poll event",
-            ))
-        }
+    fn next_with_metadata(&mut self) -> io::Result<(&[u8], crate::PacketMetadata)> {
+        let (len, ts) = self.next_impl()?;
+        Ok((
+            &self.read_buffer[0..len],
+            crate::PacketMetadata { timestamp: ts },
+        ))
     }
 }
 
@@ -408,3 +501,4 @@ pub fn interfaces() -> Vec<NetworkInterface> {
     mod interfaces;
     interfaces::interfaces()
 }
+
