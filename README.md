@@ -1,3 +1,9 @@
+# ⚠️
+> [!WARNING]
+> **This is a fork of [libpnet](https://github.com/libpnet/libpnet) published as [`rgon-pnet`](https://crates.io/crates/rgon-pnet) on crates.io.**
+> It exists solely to support the [r-lanscan](https://github.com/robgonnella/r-lanscan) project and adds packet capture timestamp support.
+> **You are almost certainly looking for the original upstream project at https://github.com/libpnet/libpnet.**
+
 # libpnet [![Crates.io](https://img.shields.io/crates/v/pnet.svg)](https://crates.io/crates/pnet) ![License](https://img.shields.io/crates/l/pnet.svg) [![Documentation](https://docs.rs/pnet/badge.svg)](https://docs.rs/pnet/)
 
 Build Status: [![Build Status](https://github.com/libpnet/libpnet/actions/workflows/ci.yml/badge.svg)](https://github.com/libpnet/libpnet/actions/workflows/ci.yml)
